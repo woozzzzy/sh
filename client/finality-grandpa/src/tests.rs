@@ -1090,7 +1090,7 @@ fn voter_persists_its_votes() {
 
 	{
 		let (round_rx, round_tx) = bob_network.round_communication(
-			Some((peers[1].public().into(), bob_keystore).into()),
+			vec![(peers[1].public().into(), bob_keystore).into()],
 			communication::Round(1),
 			communication::SetId(0),
 			Arc::new(VoterSet::new(voters).unwrap()),

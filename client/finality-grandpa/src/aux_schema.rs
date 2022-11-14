@@ -18,7 +18,10 @@
 
 //! Schema for stuff in the aux-db.
 
-use std::fmt::Debug;
+use std::{
+	collections::BTreeMap,
+	fmt::Debug,
+};
 
 use finality_grandpa::round::State as RoundState;
 use log::{info, warn};
@@ -27,7 +30,7 @@ use parity_scale_codec::{Decode, Encode};
 use fork_tree::ForkTree;
 use sc_client_api::backend::AuxStore;
 use sp_blockchain::{Error as ClientError, Result as ClientResult};
-use sp_finality_grandpa::{AuthorityList, RoundNumber, SetId};
+use sp_finality_grandpa::{AuthorityId, AuthorityList, RoundNumber, SetId};
 use sp_runtime::traits::{Block as BlockT, NumberFor};
 
 use crate::{
@@ -36,7 +39,7 @@ use crate::{
 	},
 	environment::{
 		CompletedRound, CompletedRounds, CurrentRounds, HasVoted, SharedVoterSetState,
-		VoterSetState,
+		Vote, VoterSetState,
 	},
 	GrandpaJustification, NewAuthoritySet,
 };
@@ -47,7 +50,7 @@ const CONCLUDED_ROUNDS: &[u8] = b"grandpa_concluded_rounds";
 const AUTHORITY_SET_KEY: &[u8] = b"grandpa_voters";
 const BEST_JUSTIFICATION: &[u8] = b"grandpa_best_justification";
 
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 1007;
 
 /// The voter set state.
 #[derive(Debug, Clone, Encode, Decode)]
@@ -140,6 +143,67 @@ struct V2AuthoritySet<H, N> {
 	set_id: u64,
 	pending_standard_changes: ForkTree<H, N, PendingChange<H, N>>,
 	pending_forced_changes: Vec<PendingChange<H, N>>,
+}
+
+/// Whether we've voted already during a prior run of the program.
+#[derive(Clone, Debug, Decode, Encode, PartialEq)]
+pub enum HasVotedPreMK<Block: BlockT> {
+	/// Has not voted already in this round.
+	No,
+	/// Has voted in this round.
+	Yes(AuthorityId, Vote<Block>),
+}
+
+impl<B: BlockT> Into<HasVoted<B>> for &HasVotedPreMK<B>
+{
+	fn into(self) -> HasVoted<B> {
+		match self {
+			HasVotedPreMK::No => HasVoted::No,
+			HasVotedPreMK::Yes(a, b) => HasVoted::Yes(vec![a.clone()], b.clone()),
+		}
+	}
+}
+
+/// A map with voter status information for currently live rounds,
+/// which votes have we cast and what are they.
+pub type CurrentRoundsPreMK<Block> = BTreeMap<RoundNumber, HasVotedPreMK<Block>>;
+
+/// The state of the current voter set, whether it is currently active or not
+/// and information related to the previously completed rounds. Current round
+/// voting status is used when restarting the voter, i.e. it will re-use the
+/// previous votes for a given round if appropriate (same round and same local
+/// key).
+#[derive(Debug, Decode, Encode, PartialEq)]
+pub enum VoterSetStatePreMK<Block: BlockT> {
+	/// The voter is live, i.e. participating in rounds.
+	Live {
+		/// The previously completed rounds.
+		completed_rounds: CompletedRounds<Block>,
+		/// Voter status for the currently live rounds.
+		current_rounds: CurrentRoundsPreMK<Block>,
+	},
+	/// The voter is paused, i.e. not casting or importing any votes.
+	Paused {
+		/// The previously completed rounds.
+		completed_rounds: CompletedRounds<Block>,
+	},
+}
+
+impl<B: BlockT> Into<VoterSetState<B>> for VoterSetStatePreMK<B>
+{
+	fn into(self) -> VoterSetState<B> {
+		match self {
+			VoterSetStatePreMK::Live{completed_rounds: d, current_rounds: t} => {
+				let mut cr: BTreeMap<RoundNumber, HasVoted<B>> = BTreeMap::new();
+				t.iter().for_each(|(k,v)| {
+					cr.insert(*k, v.into());
+				});
+
+				VoterSetState::Live{completed_rounds: d, current_rounds: cr}
+			},
+			VoterSetStatePreMK::Paused{completed_rounds: d} => VoterSetState::Paused{completed_rounds: d},
+		}
+	}
 }
 
 pub(crate) fn load_decode<B: AuxStore, T: Decode>(
@@ -296,8 +360,8 @@ where
 		let new_set: AuthoritySet<Block::Hash, NumberFor<Block>> = old_set.into();
 		backend.insert_aux(&[(AUTHORITY_SET_KEY, new_set.encode().as_slice())], &[])?;
 
-		let set_state = match load_decode::<_, VoterSetState<Block>>(backend, SET_STATE_KEY)? {
-			Some(state) => state,
+		let set_state: VoterSetState<Block> = match load_decode::<_, VoterSetStatePreMK<Block>>(backend, SET_STATE_KEY)? {
+			Some(state) => state.into(),
 			None => {
 				let state = genesis_round();
 				let base = state.prevote_ghost
@@ -360,11 +424,36 @@ where
 			}
 		},
 		Some(3) => {
+
+			CURRENT_VERSION.using_encoded(|s| backend.insert_aux(&[(VERSION_KEY, s)], &[]))?;
+
 			if let Some(set) = load_decode::<_, AuthoritySet<Block::Hash, NumberFor<Block>>>(
 				backend,
 				AUTHORITY_SET_KEY,
 			)? {
-				let set_state =
+
+				let set_state: VoterSetState<Block> =
+					match load_decode::<_, VoterSetStatePreMK<Block>>(backend, SET_STATE_KEY)? {
+						Some(state) => state.into(),
+						None => {
+							let state = make_genesis_round();
+							let base = state.prevote_ghost
+							.expect("state is for completed round; completed rounds must have a prevote ghost; qed.");
+
+							VoterSetState::live(set.set_id, &set, base)
+						},
+					};
+
+
+				return Ok(PersistentData { authority_set: set.into(), set_state: set_state.into() })
+			}
+		},
+		Some(1007) => {
+			if let Some(set) = load_decode::<_, AuthoritySet<Block::Hash, NumberFor<Block>>>(
+				backend,
+				AUTHORITY_SET_KEY,
+			)? {
+				let set_state: VoterSetState<Block> =
 					match load_decode::<_, VoterSetState<Block>>(backend, SET_STATE_KEY)? {
 						Some(state) => state,
 						None => {
@@ -488,6 +577,80 @@ pub(crate) fn write_concluded_round<Block: BlockT, B: AuxStore>(
 	backend.insert_aux(&[(&key[..], round_data.encode().as_slice())], &[])
 }
 
+pub fn unmigrate_grandpa_db<Block: BlockT, B>(
+	backend: &B,
+	genesis_hash: Block::Hash,
+	genesis_number: NumberFor<Block>,
+) -> ClientResult<()>
+where
+	B: AuxStore,
+{
+
+	let version: Option<u32> = load_decode(backend, VERSION_KEY)?;
+
+	let make_genesis_round = move || RoundState::genesis((genesis_hash, genesis_number));
+
+	match version {
+		Some(1007) => {
+			if let Some(set) = load_decode::<_, AuthoritySet<Block::Hash, NumberFor<Block>>>(
+				backend,
+				AUTHORITY_SET_KEY,
+			)? {
+				let set_state: VoterSetStatePreMK<Block> =
+					match load_decode::<_, VoterSetState<Block>>(backend, SET_STATE_KEY)? {
+						Some(state) => {
+							match state {
+								VoterSetState::Live{completed_rounds: d, current_rounds: t} => {
+									let mut cr: BTreeMap<RoundNumber, HasVotedPreMK<Block>> = BTreeMap::new();
+									t.iter().for_each(|(k,v)| {
+										let v_premk = match v {
+											HasVoted::No => HasVotedPreMK::No,
+											HasVoted::Yes(a, b) => HasVotedPreMK::Yes(a[0].clone(), b.clone()),
+										};
+										cr.insert(*k, v_premk);
+									});
+
+									VoterSetStatePreMK::Live{completed_rounds: d, current_rounds: cr}
+								},
+								VoterSetState::Paused{completed_rounds: d} => VoterSetStatePreMK::Paused{completed_rounds: d},
+							}
+						},
+						None => {
+							let state = make_genesis_round();
+							let base = state.prevote_ghost
+							.expect("state is for completed round; completed rounds must have a prevote ghost; qed.");
+
+							let state = RoundState::genesis((base.0, base.1));
+							let completed_rounds = CompletedRounds::new(
+								CompletedRound {
+									number: 0,
+									state,
+									base: (base.0, base.1),
+									votes: Vec::new(),
+								},
+								set.set_id,
+								&set,
+							);
+
+							let mut current_rounds = CurrentRoundsPreMK::new();
+							current_rounds.insert(1, HasVotedPreMK::No);
+
+							VoterSetStatePreMK::Live { completed_rounds, current_rounds }
+						},
+					};
+
+				backend.insert_aux(&[(SET_STATE_KEY, set_state.encode().as_slice())], &[])?;
+				3u32.using_encoded(|s| backend.insert_aux(&[(VERSION_KEY, s)], &[]))?;
+				Ok(())
+			} else {
+				return Err(ClientError::Backend(format!("Unable to load GRANDPA DB")));
+			}
+		},
+		_ =>
+			return Err(ClientError::Backend(format!("Unsupported GRANDPA DB version"))),
+	}
+}
+
 #[cfg(test)]
 pub(crate) fn load_authorities<B: AuxStore, H: Decode, N: Decode + Clone + Ord>(
 	backend: &B,
@@ -499,7 +662,6 @@ pub(crate) fn load_authorities<B: AuxStore, H: Decode, N: Decode + Clone + Ord>(
 mod test {
 	use super::*;
 	use sp_core::{crypto::UncheckedFrom, H256};
-	use sp_finality_grandpa::AuthorityId;
 	use substrate_test_runtime_client;
 
 	fn dummy_id() -> AuthorityId {
