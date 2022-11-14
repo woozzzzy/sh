@@ -20,6 +20,6 @@ pallet-staking = { version = "4.0.0-dev", path = "../../../frame/staking" }
 sp-io = { version = "6.0.0", path = "../../../primitives/io" }
 
 # third party
-chrono = { version = "0.4.19" }
+chrono = { version = "0.4.20" }
 git2 = { version = "0.13.25", default-features = false }
 num-format = { version = "0.4.0" }
