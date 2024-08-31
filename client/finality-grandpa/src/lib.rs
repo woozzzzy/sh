@@ -675,7 +675,8 @@ where
 	N: NetworkT<Block>,
 	NumberFor<Block>: BlockNumberOps,
 {
-	let is_voter = local_authority_id(voters, keystore).is_some();
+	let local_authorities = all_local_authority_ids(voters, keystore);
+	let is_voter = 0 < local_authorities.len();
 
 	// verification stream
 	let (global_in, global_out) =
@@ -789,7 +790,15 @@ where
 		telemetry.clone(),
 	);
 
-	let conf = config.clone();
+	let authorities = persistent_data.authority_set.clone();
+	let local_authorities = all_local_authority_ids(&authorities.current_authorities(), config.keystore.as_ref());
+
+	let authority_id = if 0 < local_authorities.len() {
+			local_authorities.iter().map(|x|x.to_string()).collect::<Vec<_>>().join(", ")
+		} else {
+			"".to_string()
+		};
+
 	let telemetry_task =
 		if let Some(telemetry_on_connect) = telemetry.as_ref().map(|x| x.on_connect_stream()) {
 			let authorities = persistent_data.authority_set.clone();
@@ -797,8 +806,6 @@ where
 			let events = telemetry_on_connect.for_each(move |_| {
 				let current_authorities = authorities.current_authorities();
 				let set_id = authorities.set_id();
-				let maybe_authority_id =
-					local_authority_id(&current_authorities, conf.keystore.as_ref());
 
 				let authorities =
 					current_authorities.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>();
@@ -812,7 +819,7 @@ where
 					telemetry;
 					CONSENSUS_INFO;
 					"afg.authority_set";
-					"authority_id" => maybe_authority_id.map_or("".into(), |s| s.to_string()),
+					"authority_id" => authority_id,
 					"authority_set_id" => ?set_id,
 					"authorities" => authorities,
 				);
@@ -951,9 +958,13 @@ where
 	fn rebuild_voter(&mut self) {
 		debug!(target: "afg", "{}: Starting new voter with set ID {}", self.env.config.name(), self.env.set_id);
 
-		let maybe_authority_id =
-			local_authority_id(&self.env.voters, self.env.config.keystore.as_ref());
-		let authority_id = maybe_authority_id.map_or("<unknown>".into(), |s| s.to_string());
+		let local_authorities = all_local_authority_ids(&self.env.voters, self.env.config.keystore.as_ref());
+
+		let authority_id = if 0 < local_authorities.len() {
+				local_authorities.iter().map(|x|x.to_string()).collect::<Vec<_>>().join(", ")
+			} else {
+				"<unknown>".to_string()
+			};
 
 		telemetry!(
 			self.telemetry;
@@ -1148,20 +1159,21 @@ where
 }
 
 /// Checks if this node has any available keys in the keystore for any authority id in the given
-/// voter set.  Returns the authority id for which keys are available, or `None` if no keys are
-/// available.
-fn local_authority_id(
+/// voter set.  Returns the set of all authority ids for which keys are available, or `None` if
+/// no keys are available.
+pub fn all_local_authority_ids(
 	voters: &VoterSet<AuthorityId>,
 	keystore: Option<&SyncCryptoStorePtr>,
-) -> Option<AuthorityId> {
-	keystore.and_then(|keystore| {
-		voters
-			.iter()
-			.find(|(p, _)| {
+) -> Vec<AuthorityId> {
+	match keystore {
+		Some(keystore) => voters.iter()
+			.filter(|(p, _)| {
 				SyncCryptoStore::has_keys(&**keystore, &[(p.to_raw_vec(), AuthorityId::ID)])
 			})
 			.map(|(p, _)| p.clone())
-	})
+			.collect(),
+		None => vec![],
+	}
 }
 
 /// Reverts protocol aux data to at most the last finalized block.

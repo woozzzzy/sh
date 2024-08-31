@@ -314,22 +314,25 @@ impl<B: BlockT, N: Network<B>> NetworkBridge<B, N> {
 	/// round messages to the network all within the current set.
 	pub(crate) fn round_communication(
 		&self,
-		keystore: Option<LocalIdKeystore>,
+		keystores: Vec<LocalIdKeystore>,
 		round: Round,
 		set_id: SetId,
 		voters: Arc<VoterSet<AuthorityId>>,
 		has_voted: HasVoted<B>,
-	) -> (impl Stream<Item = SignedMessage<B>> + Unpin, OutgoingMessages<B>) {
+	) -> (impl Stream<Item = SignedMessage<B>> + Unpin, Vec<OutgoingMessages<B>>) {
 		self.note_round(round, set_id, &*voters);
 
-		let keystore = keystore.and_then(|ks| {
-			let id = ks.local_id();
-			if voters.contains(id) {
-				Some(ks)
-			} else {
-				None
+		let mut filtered_ks = Vec::new();
+		for ks in keystores {
+			if voters.contains(&ks.local_id()) {
+				filtered_ks.push(ks);
 			}
-		});
+		}
+		debug!(
+			target: "gramps",
+			"🧓 Filtered authorities in round_communication: {:?}.",
+			filtered_ks.iter().map(|x|x.local_id()).collect::<Vec<_>>(),
+		);
 
 		let topic = round_topic::<B>(round.0, set_id.0);
 		let telemetry = self.telemetry.clone();
@@ -393,23 +396,30 @@ impl<B: BlockT, N: Network<B>> NetworkBridge<B, N> {
 				}
 			});
 
-		let (tx, out_rx) = mpsc::channel(0);
-		let outgoing = OutgoingMessages::<B> {
-			keystore,
-			round: round.0,
-			set_id: set_id.0,
-			network: self.gossip_engine.clone(),
-			sender: tx,
-			has_voted,
-			telemetry: self.telemetry.clone(),
-		};
+		let mut outgoings = Vec::new();
+		let mut rxs = Vec::new();
+		for ks in filtered_ks.into_iter() {
+			let (tx, out_rx) = mpsc::channel(0);
+			let outgoing = OutgoingMessages::<B> {
+				keystore: Some(ks),
+				round: round.0,
+				set_id: set_id.0,
+				network: self.gossip_engine.clone(),
+				sender: tx,
+				has_voted: has_voted.clone(),
+				telemetry: self.telemetry.clone(),
+			};
+			rxs.push(out_rx);
+			outgoings.push(outgoing);
+		}
 
 		// Combine incoming votes from external GRANDPA nodes with outgoing
 		// votes from our own GRANDPA voter to have a single
 		// vote-import-pipeline.
+		let out_rx = stream::select_all(rxs);
 		let incoming = stream::select(incoming, out_rx);
 
-		(incoming, outgoing)
+		(incoming, outgoings)
 	}
 
 	/// Set up the global communication streams.
@@ -722,6 +732,13 @@ impl<Block: BlockT> Sink<Message<Block>> for OutgoingMessages<Block> {
 
 		// when locals exist, sign messages on import
 		if let Some(ref keystore) = self.keystore {
+			log::debug!(
+				target: "gramps",
+				"🧓 Send signed {:?} in start_send for id: {:?}.",
+				msg.clone(),
+				keystore.local_id().clone(),
+			);
+
 			let target_hash = *(msg.target().0);
 			let signed = sp_finality_grandpa::sign_message(
 				keystore.keystore(),

@@ -55,7 +55,7 @@ use crate::{
 	authorities::{AuthoritySet, SharedAuthoritySet},
 	communication::Network as NetworkT,
 	justification::GrandpaJustification,
-	local_authority_id,
+	all_local_authority_ids,
 	notification::GrandpaJustificationSender,
 	until_imported::UntilVoteTargetImported,
 	voting_rule::VotingRule as VotingRuleT,
@@ -262,7 +262,7 @@ pub enum HasVoted<Block: BlockT> {
 	/// Has not voted already in this round.
 	No,
 	/// Has voted in this round.
-	Yes(AuthorityId, Vote<Block>),
+	Yes(Vec<AuthorityId>, Vote<Block>),
 }
 
 /// The votes cast by this voter already during a prior run of the program.
@@ -327,7 +327,7 @@ pub struct SharedVoterSetState<Block: BlockT> {
 	inner: Arc<RwLock<VoterSetState<Block>>>,
 	/// A tracker for the rounds that we are actively participating on (i.e. voting)
 	/// and the authority id under which we are doing it.
-	voting: Arc<RwLock<HashMap<RoundNumber, AuthorityId>>>,
+	voting: Arc<RwLock<HashMap<RoundNumber, Vec<AuthorityId>>>>,
 }
 
 impl<Block: BlockT> From<VoterSetState<Block>> for SharedVoterSetState<Block> {
@@ -351,13 +351,13 @@ impl<Block: BlockT> SharedVoterSetState<Block> {
 	}
 
 	/// Get the authority id that we are using to vote on the given round, if any.
-	pub(crate) fn voting_on(&self, round: RoundNumber) -> Option<AuthorityId> {
+	pub(crate) fn voting_on(&self, round: RoundNumber) -> Option<Vec<AuthorityId>> {
 		self.voting.read().get(&round).cloned()
 	}
 
 	/// Note that we started voting on the give round with the given authority id.
-	pub(crate) fn started_voting_on(&self, round: RoundNumber, local_id: AuthorityId) {
-		self.voting.write().insert(round, local_id);
+	pub(crate) fn started_voting_on(&self, round: RoundNumber, local_ids: Vec<AuthorityId>) {
+		self.voting.write().insert(round, local_ids);
 	}
 
 	/// Note that we have finished voting on the given round. If we were voting on
@@ -373,7 +373,7 @@ impl<Block: BlockT> SharedVoterSetState<Block> {
 			VoterSetState::Live { current_rounds, .. } => current_rounds
 				.get(&round)
 				.and_then(|has_voted| match has_voted {
-					HasVoted::Yes(id, vote) => Some(HasVoted::Yes(id.clone(), vote.clone())),
+					HasVoted::Yes(ids, vote) => Some(HasVoted::Yes(ids.clone(), vote.clone())),
 					_ => None,
 				})
 				.unwrap_or(HasVoted::No),
@@ -490,8 +490,8 @@ where
 		&self,
 		equivocation: Equivocation<Block::Hash, NumberFor<Block>>,
 	) -> Result<(), Error> {
-		if let Some(local_id) = self.voter_set_state.voting_on(equivocation.round_number()) {
-			if *equivocation.offender() == local_id {
+		if let Some(local_ids) = self.voter_set_state.voting_on(equivocation.round_number()) {
+			if local_ids.contains(equivocation.offender()) {
 				return Err(Error::Safety(
 					"Refraining from sending equivocation report for our own equivocation.".into(),
 				))
@@ -704,15 +704,44 @@ where
 		let prevote_timer = Delay::new(self.config.gossip_duration * 2);
 		let precommit_timer = Delay::new(self.config.gossip_duration * 4);
 
-		let local_id = local_authority_id(&self.voters, self.config.keystore.as_ref());
+		let local_authorities = all_local_authority_ids(&self.voters, self.config.keystore.as_ref());
+		debug!(
+			target: "gramps",
+			"🧓 Authorities for round {:?} in round_data: {:?}.",
+			round,
+			local_authorities.clone(),
+		);
 
 		let has_voted = match self.voter_set_state.has_voted(round) {
-			HasVoted::Yes(id, vote) =>
-				if local_id.as_ref().map(|k| k == &id).unwrap_or(false) {
-					HasVoted::Yes(id, vote)
+			HasVoted::Yes(ids, vote) => {
+				if 0 < local_authorities.len() {
+					let voting_ids = local_authorities.iter().filter(|k| ids.contains(k)).cloned().collect::<Vec<_>>();
+					if 0 < voting_ids.len() {
+						debug!(
+							target: "gramps",
+							"🧓 Voting ids for round {:?} in round_data for Yes vote: {:?}.",
+							round,
+							voting_ids.clone(),
+						);
+						HasVoted::Yes(voting_ids, vote)
+					} else {
+						debug!(
+							target: "gramps",
+							"🧓 Voting ids for round {:?} in round_data for No vote: {:?}.",
+							round,
+							voting_ids.clone(),
+						);
+						HasVoted::No
+					}
 				} else {
+					debug!(
+						target: "gramps",
+						"🧓 No voting ids for round {:?} in round_data.",
+						round,
+					);
 					HasVoted::No
-				},
+				}
+			},
 			HasVoted::No => HasVoted::No,
 		};
 
@@ -723,19 +752,21 @@ where
 		// could lead to internal state inconsistencies in the voter environment
 		// (e.g. we wouldn't update the voter set state after prevoting since there's
 		// no local authority id).
-		if let Some(id) = local_id.as_ref() {
-			self.voter_set_state.started_voting_on(round, id.clone());
+		if 0 < local_authorities.len() {
+			self.voter_set_state.started_voting_on(round, local_authorities.clone());
 		}
 
 		// we can only sign when we have a local key in the authority set
 		// and we have a reference to the keystore.
-		let keystore = match (local_id.as_ref(), self.config.keystore.as_ref()) {
-			(Some(id), Some(keystore)) => Some((id.clone(), keystore.clone()).into()),
-			_ => None,
+		let mut keystores = Vec::new();
+		if let Some(ref keystore) = &self.config.keystore {
+			for a in local_authorities.clone() {
+				keystores.push((a, keystore.clone()).into());
+			}
 		};
 
-		let (incoming, outgoing) = self.network.round_communication(
-			keystore,
+		let (incoming, outgoings) = self.network.round_communication(
+			keystores,
 			crate::communication::Round(round),
 			crate::communication::SetId(self.set_id),
 			self.voters.clone(),
@@ -756,15 +787,21 @@ where
 			.map_err(Into::into),
 		);
 
-		// schedule network message cleanup when sink drops.
-		let outgoing = Box::pin(outgoing.sink_err_into());
+		let mut pinned_ogs: Vec<Pin<Box<dyn futures::Sink<
+			finality_grandpa::Message<<Block as BlockT>::Hash, <<Block as BlockT>::Header as HeaderT>::Number>,
+			Error = CommandOrError<<Block as BlockT>::Hash, <<Block as BlockT>::Header as HeaderT>::Number>> + std::marker::Send>>
+		> = Vec::new();
+		for outgoing in outgoings{
+			// schedule network message cleanup when sink drops.
+			pinned_ogs.push(Box::pin(outgoing.sink_err_into()));
+		}
 
 		voter::RoundData {
-			voter_id: local_id,
+			voter_ids: local_authorities,
 			prevote_timer: Box::pin(prevote_timer.map(Ok)),
 			precommit_timer: Box::pin(precommit_timer.map(Ok)),
 			incoming,
-			outgoing,
+			outgoings: pinned_ogs,
 		}
 	}
 
@@ -773,8 +810,8 @@ where
 		round: RoundNumber,
 		propose: PrimaryPropose<Block>,
 	) -> Result<(), Self::Error> {
-		let local_id = match self.voter_set_state.voting_on(round) {
-			Some(id) => id,
+		let local_ids = match self.voter_set_state.voting_on(round) {
+			Some(ids) => ids,
 			None => return Ok(()),
 		};
 
@@ -796,7 +833,14 @@ where
 				.get_mut(&round)
 				.expect("checked previously that key exists; qed.");
 
-			*current_round = HasVoted::Yes(local_id, Vote::Propose(propose));
+			log::debug!(
+				target: "gramps",
+				"🧓 Proposed {:?} in update_voter_set_state for round {:?} local ids: {:?}.",
+				propose.clone(),
+				round,
+				local_ids,
+			);
+			*current_round = HasVoted::Yes(local_ids, Vote::Propose(propose));
 
 			let set_state = VoterSetState::<Block>::Live {
 				completed_rounds: completed_rounds.clone(),
@@ -812,8 +856,8 @@ where
 	}
 
 	fn prevoted(&self, round: RoundNumber, prevote: Prevote<Block>) -> Result<(), Self::Error> {
-		let local_id = match self.voter_set_state.voting_on(round) {
-			Some(id) => id,
+		let local_ids = match self.voter_set_state.voting_on(round) {
+			Some(ids) => ids,
 			None => return Ok(()),
 		};
 
@@ -855,7 +899,14 @@ where
 				.get_mut(&round)
 				.expect("checked previously that key exists; qed.");
 
-			*current_round = HasVoted::Yes(local_id, Vote::Prevote(propose.cloned(), prevote));
+			log::debug!(
+				target: "gramps",
+				"🧓 Prevoted {:?} in update_voter_set_state for round {:?} local ids: {:?}.",
+				prevote.clone(),
+				round,
+				local_ids,
+			);
+			*current_round = HasVoted::Yes(local_ids, Vote::Prevote(propose.cloned(), prevote));
 
 			let set_state = VoterSetState::<Block>::Live {
 				completed_rounds: completed_rounds.clone(),
@@ -875,8 +926,8 @@ where
 		round: RoundNumber,
 		precommit: Precommit<Block>,
 	) -> Result<(), Self::Error> {
-		let local_id = match self.voter_set_state.voting_on(round) {
-			Some(id) => id,
+		let local_ids = match self.voter_set_state.voting_on(round) {
+			Some(ids) => ids,
 			None => return Ok(()),
 		};
 
@@ -925,8 +976,15 @@ where
 				.get_mut(&round)
 				.expect("checked previously that key exists; qed.");
 
+			log::debug!(
+				target: "gramps",
+				"🧓 Precommitted {:?} in update_voter_set_state for round {:?} local ids: {:?}.",
+				precommit.clone(),
+				round,
+				local_ids.clone(),
+			);
 			*current_round = HasVoted::Yes(
-				local_id,
+				local_ids,
 				Vote::Precommit(propose.cloned(), prevote.clone(), precommit),
 			);
 

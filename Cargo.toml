@@ -172,6 +172,7 @@ members = [
 	"primitives/debug-derive",
 	"primitives/externalities",
 	"primitives/finality-grandpa",
+	"primitives/fg",
 	"primitives/inherents",
 	"primitives/io",
 	"primitives/keyring",
